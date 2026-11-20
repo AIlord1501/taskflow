@@ -1,0 +1,23 @@
+﻿# OS & Editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Environment variables
+.env
+.env.*
+
+# Go
+backend-go/*.exe
+backend-go/bin/
+backend-go/tmp/
+
+# Python / FastAPI
+ai-worker/.venv/
+ai-worker/__pycache__/
+*.py[cod]
+
+# React / Node
+web-app/node_modules/
+web-app/dist/
