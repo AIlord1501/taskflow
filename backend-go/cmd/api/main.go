@@ -15,6 +15,7 @@ import (
 	"github.com/AIlord1501/taskflow/backend-go/internal/repository"
 	"github.com/AIlord1501/taskflow/backend-go/internal/service"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 type HealthResponse struct {
@@ -55,17 +56,41 @@ func main() {
 	}
 	slog.Info("connected to PostgreSQL successfully")
 
-	// 2. Manual Dependency Injection: Repository -> Service -> Handler
-	taskRepo := repository.NewPostgresTaskRepo(pool)
-	taskSvc := service.NewTaskService(taskRepo)
-	taskHandler := handler.NewTaskHandler(taskSvc)
+	// 2. Initialize Redis (read-through cache + durable AI job stream)
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "redis://localhost:6379"
+	}
+	redisOpts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		slog.Error("invalid REDIS_URL", "error", err)
+		os.Exit(1)
+	}
+	rdb := redis.NewClient(redisOpts)
+	defer rdb.Close()
 
-	// 3. Register Routes
+	if err := rdb.Ping(initCtx).Err(); err != nil {
+		slog.Error("unable to ping redis", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("connected to Redis successfully", "addr", redisOpts.Addr)
+
+	internalSecret := os.Getenv("INTERNAL_SECRET")
+	if internalSecret == "" {
+		slog.Warn("INTERNAL_SECRET not set; AI worker callback endpoint is disabled")
+	}
+
+	// 3. Manual Dependency Injection: Repository -> Service -> Handler
+	taskRepo := repository.NewPostgresTaskRepo(pool)
+	taskSvc := service.NewTaskService(taskRepo, rdb)
+	taskHandler := handler.NewTaskHandler(taskSvc, internalSecret)
+
+	// 4. Register Routes
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", handleHealth)
 	taskHandler.RegisterRoutes(mux)
 
-	// 4. Configure & Start HTTP Server
+	// 5. Configure & Start HTTP Server
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      loggingMiddleware(corsMiddleware(mux)),
@@ -82,7 +107,7 @@ func main() {
 		}
 	}()
 
-	// 5. Graceful Shutdown
+	// 6. Graceful Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

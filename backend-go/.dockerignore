@@ -1,0 +1,7 @@
+*.exe
+bin/
+tmp/
+.env
+.env.*
+Dockerfile
+.dockerignore

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -10,12 +11,16 @@ import (
 	"github.com/AIlord1501/taskflow/backend-go/internal/service"
 )
 
+// InternalSecretHeader authenticates service-to-service callbacks from the AI worker pool.
+const InternalSecretHeader = "X-Internal-Secret"
+
 type TaskHandler struct {
-	svc *service.TaskService
+	svc            *service.TaskService
+	internalSecret []byte
 }
 
-func NewTaskHandler(svc *service.TaskService) *TaskHandler {
-	return &TaskHandler{svc: svc}
+func NewTaskHandler(svc *service.TaskService, internalSecret string) *TaskHandler {
+	return &TaskHandler{svc: svc, internalSecret: []byte(internalSecret)}
 }
 
 // RegisterRoutes attaches all task endpoints to the Go 1.22+ ServeMux.
@@ -24,6 +29,55 @@ func (h *TaskHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tasks", h.ListTasks)
 	mux.HandleFunc("PATCH /api/v1/tasks/{id}/status", h.UpdateTaskStatus)
 	mux.HandleFunc("DELETE /api/v1/tasks/{id}", h.DeleteTask)
+
+	// Internal: AI worker -> Go callback (never expose without the shared secret).
+	mux.Handle("PATCH /api/v1/internal/tasks/{id}/ai", h.requireInternalSecret(http.HandlerFunc(h.UpdateTaskAI)))
+}
+
+// requireInternalSecret rejects requests lacking a matching X-Internal-Secret.
+// If INTERNAL_SECRET is unset the endpoint is disabled entirely (fail closed).
+func (h *TaskHandler) requireInternalSecret(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(h.internalSecret) == 0 {
+			writeError(w, http.StatusServiceUnavailable, "internal endpoint disabled: INTERNAL_SECRET not configured")
+			return
+		}
+		provided := []byte(r.Header.Get(InternalSecretHeader))
+		if subtle.ConstantTimeCompare(provided, h.internalSecret) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid internal secret")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *TaskHandler) UpdateTaskAI(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+	var payload struct {
+		AISummary     string   `json:"ai_summary"`
+		SuggestedTags []string `json:"suggested_tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON payload: "+err.Error())
+		return
+	}
+
+	if err := h.svc.UpdateAIEnrichment(r.Context(), id, payload.AISummary, payload.SuggestedTags); err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidInput):
+			writeError(w, http.StatusBadRequest, "task id and non-empty ai_summary are required")
+		case errors.Is(err, service.ErrTaskNotFound):
+			writeError(w, http.StatusNotFound, "task not found")
+		default:
+			slog.Error("failed to persist AI enrichment", "task_id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal server error")
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *TaskHandler) CreateTask(w http.ResponseWriter, r *http.Request) {

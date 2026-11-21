@@ -1,0 +1,184 @@
+# TaskFlow production stack.
+#
+#   cp .env.example .env   # fill in DOMAIN, ACME_EMAIL, POSTGRES_PASSWORD, INTERNAL_SECRET
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Traffic: Internet -> caddy (TLS) -> go-api x2 -> pgbouncer -> postgres
+#                                        \-> redis (cache + taskflow:ai_jobs stream) <- ai-worker x2
+
+name: taskflow
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    <<: [*restart, *logging]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    depends_on:
+      go-api:
+        condition: service_healthy
+    networks: [edge]
+
+  go-api:
+    build:
+      context: ./backend-go
+    image: taskflow/go-api:latest
+    <<: [*restart, *logging]
+    deploy:
+      replicas: 2
+      resources:
+        limits: { cpus: "2", memory: 512M }
+    environment:
+      PORT: "8080"
+      # Transaction-mode PgBouncer requires the simple protocol (no server-side prepared statements).
+      DATABASE_URL: postgres://${POSTGRES_USER:-taskflow}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@pgbouncer:6432/${POSTGRES_DB:-taskflow}?sslmode=disable&default_query_exec_mode=simple_protocol&pool_max_conns=${GO_DB_POOL_MAX_CONNS:-50}
+      REDIS_URL: redis://redis:6379/0
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?set INTERNAL_SECRET in .env}
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [edge, backend]
+
+  ai-worker:
+    build:
+      context: ./ai-worker
+    image: taskflow/ai-worker:latest
+    <<: [*restart, *logging]
+    deploy:
+      replicas: 2
+      resources:
+        limits: { cpus: "1", memory: 256M }
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      # Docker DNS round-robins across go-api replicas.
+      GO_API_URL: http://go-api:8080
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?set INTERNAL_SECRET in .env}
+      AI_BATCH_SIZE: ${AI_BATCH_SIZE:-16}
+    depends_on:
+      redis:
+        condition: service_healthy
+      go-api:
+        condition: service_healthy
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    <<: [*restart, *logging]
+    # AOF (fsync every second) keeps queued AI jobs durable across restarts.
+    # volatile-lru only evicts keys WITH a TTL (the tasks:all cache) — the
+    # taskflow:ai_jobs stream has no TTL and is never evicted.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-1gb}
+      - --maxmemory-policy
+      - volatile-lru
+      - --maxclients
+      - "20000"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    <<: [*restart, *logging]
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER:-taskflow}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      DB_NAME: ${POSTGRES_DB:-taskflow}
+      LISTEN_PORT: "6432"
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      # Thousands of cheap client connections multiplexed onto a small server pool.
+      MAX_CLIENT_CONN: "10000"
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_POOL_SIZE:-80}
+      RESERVE_POOL_SIZE: "20"
+      SERVER_RESET_QUERY: ""
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ${POSTGRES_USER:-taskflow} || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+
+  postgres:
+    image: postgres:16-alpine
+    <<: [*restart, *logging]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-taskflow}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=8MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Applied automatically on first boot (empty volume) only.
+      - ./backend-go/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-taskflow} -d ${POSTGRES_DB:-taskflow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+networks:
+  edge:
+  backend:
+    internal: true # no egress / no host exposure for data services
+
+volumes:
+  caddy_data:
+  caddy_config:
+  redis_data:
+  pgdata:
